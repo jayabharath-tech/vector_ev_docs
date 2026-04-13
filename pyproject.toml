@@ -1,0 +1,14 @@
+[project]
+name = "vector-ev-docs"
+version = "1.0.0"
+description = "Production-ready Retrieval-Augmented Generation (RAG) system for Vector Elektronik technical documentation using Pydantic AI, ChromaDB, and Claude. Ingests PDFs, generates semantic embeddings, retrieves relevant context, and provides grounded answers with full source attribution."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "chromadb>=1.5.5",
+    "langchain-community>=0.4.1",
+    "pydantic-ai-slim[anthropic,sentence-transformers]>=1.77.0",
+    "pydantic-evals>=1.77.0",
+    "pymupdf>=1.27.2.2",
+    "streamlit>=1.56.0",
+]
