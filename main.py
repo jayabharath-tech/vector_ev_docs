@@ -3,14 +3,16 @@ RAG Agent for Vector Elektronik Technical Documentation.
 Retrieves relevant context from knowledge base and generates grounded answers.
 """
 import warnings
+import os
 
+# Load environment variables from .env file FIRST, before any other code
 from dotenv import load_dotenv
+load_dotenv()
 
 from telemetry import init_telemetry
 
 warnings.filterwarnings('ignore')
 
-import os
 import threading
 import logging
 from dataclasses import dataclass
@@ -31,7 +33,7 @@ from db import VectorDBClient
 # ============================================================================
 
 # RAG_LOG_LEVEL environment variable: DEBUG, INFO, WARNING, ERROR
-# Example: export RAG_LOG_LEVEL=DEBUG
+# Set in .env: RAG_LOG_LEVEL=DEBUG (default: INFO)
 RAG_LOG_LEVEL = os.getenv("RAG_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, RAG_LOG_LEVEL, logging.INFO),
@@ -39,13 +41,118 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# CONFIGURATION FROM .env FILE
+# ============================================================================
+
 # Query expansion configuration
-# Set to "false" or "0" to disable expansion during evaluation/assessment
-# Example: export RAG_ENABLE_QUERY_EXPANSION=false
+# Set in .env: RAG_ENABLE_QUERY_EXPANSION=false (default: true)
 RAG_ENABLE_QUERY_EXPANSION = os.getenv("RAG_ENABLE_QUERY_EXPANSION", "true").lower() not in ("false", "0")
 
-load_dotenv()
+# LLM Provider configuration
+# Set in .env: RAG_LLM_PROVIDER=groq|anthropic (default: anthropic)
+# Set in .env: RAG_LLM_MODEL=model_name (default: claude-haiku-4-5-20251001)
+RAG_LLM_PROVIDER = os.getenv("RAG_LLM_PROVIDER", "anthropic").lower()
+RAG_LLM_MODEL = os.getenv("RAG_LLM_MODEL", "claude-haiku-4-5-20251001")
+
 init_telemetry(project_name="Vector EV Docs RAG")
+
+# ============================================================================
+# LLM PROVIDER ABSTRACTION
+# ============================================================================
+
+def get_llm_client():
+    """
+    Factory function to get the configured LLM client.
+
+    Supports:
+    - "anthropic": Uses Anthropic API (default)
+    - "groq": Uses Groq API for fast inference
+
+    Environment variables:
+    - RAG_LLM_PROVIDER: Provider selection
+    - RAG_LLM_MODEL: Model name override (provider-dependent)
+    """
+    if RAG_LLM_PROVIDER == "groq":
+        try:
+            from groq import Groq
+            return Groq(api_key=os.getenv("GROQ_API_KEY"))
+        except ImportError:
+            logger.error("Groq provider selected but groq package not installed. Install with: pip install groq")
+            raise
+    else:  # Default to anthropic
+        from anthropic import Anthropic
+        return Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+
+async def describe_image_with_vision(image_bytes: bytes, media_type: str = "image/png") -> str:
+    """
+    Describe an image using the configured LLM provider's vision API.
+
+    Args:
+        image_bytes: Raw image bytes
+        media_type: MIME type (e.g. "image/png", "image/jpeg")
+
+    Returns:
+        Text description of the image
+    """
+    import base64
+
+    if RAG_LLM_PROVIDER == "groq":
+        # Groq vision using llama-3.2-11b-vision-preview
+        client = get_llm_client()
+        encoded = base64.standard_b64encode(image_bytes).decode("utf-8")
+        response = client.chat.completions.create(
+            model="llama-3.2-11b-vision-preview",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{media_type};base64,{encoded}"}
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "This image is from a technical PDF document. "
+                            "Describe everything visible: all text, labels, numbers, "
+                            "table data, chart values, and diagram components. "
+                            "Be thorough so the description can be used as searchable text."
+                        )
+                    }
+                ]
+            }],
+            max_tokens=1024,
+        )
+        return response.choices[0].message.content
+    else:
+        # Default: Anthropic vision
+        client = get_llm_client()
+        encoded = base64.standard_b64encode(image_bytes).decode("utf-8")
+        response = client.messages.create(
+            model=RAG_LLM_MODEL,
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": encoded}
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "This image is from a technical PDF document. "
+                            "Describe everything visible: all text, labels, numbers, "
+                            "table data, chart values, and diagram components. "
+                            "Be thorough so the description can be used as searchable text."
+                        )
+                    }
+                ]
+            }]
+        )
+        return response.content[0].text
+
 
 SYSTEM_PROMPT = """You are a professional technical assistant for Vector Elektronik documentation.
 
@@ -159,9 +266,13 @@ class EVDocsClient:
         self.encoder = encoder or SentenceTransformer("all-MiniLM-L6-v2")
         self.collection = "vector_ev_docs"
 
-    def _describe_image(self, image_bytes: bytes, media_type: str = "image/png") -> str:
+    async def _describe_image(self, image_bytes: bytes, media_type: str = "image/png") -> str:
         """
-        Use Claude vision API to describe an image from a PDF.
+        Use the configured LLM provider's vision API to describe an image from a PDF.
+
+        Uses the provider specified by RAG_LLM_PROVIDER environment variable:
+        - "anthropic": Uses Anthropic's vision API
+        - "groq": Uses Groq's llama-3.2-11b-vision-preview
 
         Args:
             image_bytes: Raw image bytes
@@ -170,34 +281,7 @@ class EVDocsClient:
         Returns:
             Text description of the image
         """
-        import base64
-        from anthropic import Anthropic
-
-        client = Anthropic()
-        encoded = base64.standard_b64encode(image_bytes).decode("utf-8")
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": media_type, "data": encoded}
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "This image is from a technical PDF document. "
-                            "Describe everything visible: all text, labels, numbers, "
-                            "table data, chart values, and diagram components. "
-                            "Be thorough so the description can be used as searchable text."
-                        )
-                    }
-                ]
-            }]
-        )
-        return response.content[0].text
+        return await describe_image_with_vision(image_bytes, media_type)
 
     async def ingest(self, path: str) -> str:
         """
@@ -293,7 +377,7 @@ class EVDocsClient:
 
                         image_count += 1
                         logger.info(f"  Describing image {image_count}/{total_images} (page {page_num+1})...")
-                        description = self._describe_image(image_bytes, media_type)
+                        description = await self._describe_image(image_bytes, media_type)
 
                         all_ids.append(f"{pdf_path.stem}_img_{page_num}_{img_idx}")
                         all_chunks.append(description)
@@ -539,8 +623,7 @@ async def expand_query(query: str, num_expansions: int = 3) -> List[str]:
         List with original query + N expanded versions
     """
     try:
-        from anthropic import Anthropic
-        client = Anthropic()
+        client = get_llm_client()
 
         expansion_prompt = f"""Given this user question about EV technical documentation, generate {num_expansions} alternative phrasings that would help retrieve relevant documents.
 
@@ -554,19 +637,27 @@ Generate exactly {num_expansions} different ways to ask this question. Each shou
 
 Return ONLY the alternative queries, one per line, without numbering or bullets."""
 
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=400,
-            messages=[{"role": "user", "content": expansion_prompt}]
-        )
+        if RAG_LLM_PROVIDER == "groq":
+            response = client.chat.completions.create(
+                model="mixtral-8x7b-32768",  # Groq's recommended model for fast text
+                messages=[{"role": "user", "content": expansion_prompt}],
+                max_tokens=400,
+            )
+            expanded_text = response.choices[0].message.content
+        else:
+            response = client.messages.create(
+                model=RAG_LLM_MODEL,
+                max_tokens=400,
+                messages=[{"role": "user", "content": expansion_prompt}]
+            )
+            expanded_text = response.content[0].text
 
         # Parse expanded queries from response
-        expanded_text = response.content[0].text
         expansions = [line.strip() for line in expanded_text.strip().split('\n') if line.strip()]
 
         # Return original + up to N expansions
         result = [query] + expansions[:num_expansions]
-        logger.debug(f"Query expanded to {len(result)} variations")
+        logger.debug(f"Query expanded to {len(result)} variations ({RAG_LLM_PROVIDER} provider)")
         return result
 
     except Exception as e:
@@ -746,13 +837,21 @@ async def generate_chart_data(
 # RAG AGENT
 # ============================================================================
 
+# Format model string for pydantic_ai based on provider
+if RAG_LLM_PROVIDER == "groq":
+    agent_model = f"groq:{RAG_LLM_MODEL}"
+else:
+    agent_model = RAG_LLM_MODEL
+
 agent = Agent(
-    model="claude-haiku-4-5-20251001",
+    model=agent_model,
     output_type=AgentResponse,
     tools=[retrieve_context, generate_chart_data],
     system_prompt=SYSTEM_PROMPT,
     deps_type=RagAgentContext
 )
+
+logger.info(f"RAG Agent initialized with {RAG_LLM_PROVIDER} provider (model: {RAG_LLM_MODEL})")
 
 # ============================================================================
 # MAIN
