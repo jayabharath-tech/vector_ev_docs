@@ -1,19 +1,21 @@
 """
-Streamlit frontend for RAG chatbot.
-User-friendly interface for uploading PDFs and chatting with the RAG agent.
+Streamlit frontend for RAG chatbot with session state persistence.
+User-friendly interface with conversation history maintained across page refreshes.
+Conversations stored in backend SQLite + frontend session state cache.
 """
 import os
 import json
 import requests
 import streamlit as st
 from pathlib import Path
+from datetime import datetime
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
-HISTORY_FILE = Path(".streamlit_chat_history.json")  # Persist conversation locally
+DEFAULT_USER_ID = "default_user"  # Could be from auth system
 
 st.set_page_config(
     page_title="EV knowledgeBase",
@@ -41,12 +43,22 @@ def upload_file_to_backend(uploaded_file):
         return None
 
 
-def chat_with_backend(question, conversation_history):
-    """Send a chat request to the FastAPI backend."""
+def chat_with_backend(conversation_id, question, user_id=DEFAULT_USER_ID):
+    """
+    Send a chat request to the backend with conversation persistence.
+
+    Backend automatically:
+    - Creates new conversation if not exists
+    - Saves user message
+    - Generates response
+    - Saves assistant message
+    - Returns conversation_id with response
+    """
     try:
         payload = {
+            "conversation_id": conversation_id,
             "question": question,
-            "conversation_history": conversation_history
+            "user_id": user_id
         }
         response = requests.post(f"{BACKEND_URL}/chat", json=payload, timeout=60)
         response.raise_for_status()
@@ -62,6 +74,55 @@ def chat_with_backend(question, conversation_history):
         return None
 
 
+def load_conversation_from_backend(conversation_id):
+    """Load a full conversation from backend (all messages)."""
+    try:
+        response = requests.get(f"{BACKEND_URL}/conversations/{conversation_id}", timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        # Convert to frontend format
+        return {
+            "id": data["id"],
+            "title": data["title"],
+            "messages": data["messages"]
+        }
+    except requests.exceptions.ConnectionError:
+        st.error(f"❌ Cannot connect to backend")
+        return None
+    except Exception as e:
+        st.error(f"❌ Failed to load conversation: {str(e)}")
+        return None
+
+
+def list_conversations(user_id=DEFAULT_USER_ID, limit=10):
+    """List all conversations for a user."""
+    try:
+        response = requests.get(
+            f"{BACKEND_URL}/conversations",
+            params={"user_id": user_id, "limit": limit},
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json()
+    except:
+        return {"conversations": [], "total": 0}
+
+
+def delete_conversation_on_backend(conversation_id):
+    """Delete a conversation from backend."""
+    try:
+        response = requests.delete(
+            f"{BACKEND_URL}/conversations/{conversation_id}",
+            timeout=10
+        )
+        response.raise_for_status()
+        return True
+    except:
+        st.error(f"❌ Failed to delete conversation")
+        return False
+
+
 def check_backend_health():
     """Check if backend is healthy."""
     try:
@@ -71,45 +132,32 @@ def check_backend_health():
         return False
 
 
-def load_conversation_history():
-    """Load conversation history from file if it exists."""
-    if HISTORY_FILE.exists():
-        try:
-            with open(HISTORY_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return []
-    return []
-
-
-def save_conversation_history(history):
-    """Save conversation history to file."""
-    try:
-        with open(HISTORY_FILE, 'w') as f:
-            json.dump(history, f)
-    except Exception as e:
-        st.warning(f"Could not save conversation history: {e}")
 
 
 # ============================================================================
-# SESSION STATE
+# SESSION STATE - Maintains conversation state across page refreshes
 # ============================================================================
 
-if "conversation_history" not in st.session_state:
-    # Start with fresh history for each session
-    st.session_state.conversation_history = []
+# Conversation ID (persists across refreshes within session)
+if "conversation_id" not in st.session_state:
+    st.session_state.conversation_id = None  # Will be set on first message
 
+# Chat messages (persists across refreshes)
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Source metadata cache (persists across refreshes)
 if "source_metadata_cache" not in st.session_state:
-    st.session_state.source_metadata_cache = {}  # Store sources by message index
+    st.session_state.source_metadata_cache = {}
 
+# Backend health check
 if "backend_healthy" not in st.session_state:
     st.session_state.backend_healthy = check_backend_health()
 
-if "uploaded_files_cleared" not in st.session_state:
-    st.session_state.uploaded_files_cleared = False
-
+# File uploader state
 if "file_uploader_key" not in st.session_state:
     st.session_state.file_uploader_key = 0
+
 
 # ============================================================================
 # SIDEBAR
@@ -151,11 +199,12 @@ with st.sidebar:
     st.divider()
 
     # Conversation management
-    st.subheader("💬 Conversation")
-    if st.button("🗑️ Clear Chat History", use_container_width=True):
-        st.session_state.conversation_history = []
-        save_conversation_history([])
-        st.success("Chat history cleared")
+    st.subheader("💬 Chat")
+
+    if st.button("✨ New Chat", use_container_width=True):
+        st.session_state.conversation_id = None
+        st.session_state.messages = []
+        st.session_state.source_metadata_cache = {}
         st.rerun()
 
     st.divider()
@@ -171,17 +220,20 @@ with st.sidebar:
 # MAIN CHAT INTERFACE
 # ============================================================================
 
-st.title("🤖 Chatbot")
-st.markdown("Ask questions about your uploaded documents")
+# Header
+col1, col2 = st.columns([1, 0.2])
+with col1:
+    st.title("🤖 Chatbot")
+    st.markdown("Ask questions about your uploaded documents")
 
 # Display chat history
 chat_container = st.container()
 with chat_container:
-    for idx, message in enumerate(st.session_state.conversation_history):
+    for idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-            # Display sources for assistant messages with cached metadata
+            # Display sources for assistant messages
             if message["role"] == "assistant" and idx in st.session_state.source_metadata_cache:
                 cache_data = st.session_state.source_metadata_cache[idx]
                 source_metadata = cache_data["source_metadata"]
@@ -197,23 +249,19 @@ with chat_container:
                         st.markdown(f"- {file}")
 
 # Chat input
-col1, col2 = st.columns([1, 0.15])
-
-with col1:
-    user_input = st.chat_input(
-        "Ask a question...",
-        disabled=not st.session_state.backend_healthy
-    )
+user_input = st.chat_input(
+    "Ask a question...",
+    disabled=not st.session_state.backend_healthy
+)
 
 if user_input:
-    # Add user message to history
-    st.session_state.conversation_history.append({
+    # Add user message to session state
+    st.session_state.messages.append({
         "role": "user",
         "content": user_input
     })
-    save_conversation_history(st.session_state.conversation_history)
 
-    # Display user message
+    # Display user message immediately
     with st.chat_message("user"):
         st.markdown(user_input)
 
@@ -221,29 +269,29 @@ if user_input:
     with st.chat_message("assistant"):
         if not st.session_state.backend_healthy:
             st.error(f"❌ Backend is not responding at {BACKEND_URL}")
-            response = None
         else:
             with st.spinner("🔍 Searching knowledge base..."):
-                # Convert conversation history to backend format
-                conversation_for_api = [
-                    {"role": msg["role"], "content": msg["content"]}
-                    for msg in st.session_state.conversation_history[:-1]  # Exclude current user message
-                ]
-
-                response = chat_with_backend(user_input, conversation_for_api)
+                response = chat_with_backend(
+                    st.session_state.conversation_id,
+                    user_input,
+                    user_id=DEFAULT_USER_ID
+                )
 
             # Check if we got a valid response
             if response:
                 # Display answer
                 st.markdown(response["answer"])
 
-                # Add assistant response to history
-                message_index = len(st.session_state.conversation_history)
-                st.session_state.conversation_history.append({
+                # Update conversation ID if backend returned a new one
+                if response.get("conversation_id"):
+                    st.session_state.conversation_id = response["conversation_id"]
+
+                # Add assistant response to session state
+                message_index = len(st.session_state.messages)
+                st.session_state.messages.append({
                     "role": "assistant",
                     "content": response["answer"]
                 })
-                save_conversation_history(st.session_state.conversation_history)
 
                 # Store source metadata for this assistant message
                 if response.get("source_metadata"):
@@ -252,7 +300,7 @@ if user_input:
                         "source_snippets": response["source_snippets"]
                     }
 
-                # Rerun to show updated chat history
+                # Rerun to show updated chat
                 st.rerun()
             else:
                 st.error("Failed to get response from backend")

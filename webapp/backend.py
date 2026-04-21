@@ -1,6 +1,6 @@
 """
-FastAPI backend for RAG chatbot.
-Simple wrapper around existing RAG logic.
+FastAPI backend for RAG chatbot with conversation persistence.
+Integrates RAG system with SQLite conversation storage + in-memory cache.
 
 Run from vector_ev_docs directory:
   python -m webapp.backend
@@ -10,6 +10,7 @@ Or from base directory:
 """
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Optional, List
 
@@ -18,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ============================================================================
-# IMPORT RAG SYSTEM
+# IMPORT RAG SYSTEM & CONVERSATION MANAGER
 # ============================================================================
 # Add parent directory to path for imports
 # This allows the script to work from both:
@@ -29,6 +30,7 @@ if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
 from main import ingest_pdf, main as rag_main
+from conversation_manager import ConversationManager
 
 # ============================================================================
 # PYDANTIC MODELS
@@ -40,8 +42,9 @@ class ConversationMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    conversation_id: Optional[str] = None  # Use existing or generate new
     question: str
-    conversation_history: Optional[List[ConversationMessage]] = None
+    user_id: str = "default_user"  # Default for anonymous users
 
 
 class SourceMetadataResponse(BaseModel):
@@ -52,9 +55,24 @@ class SourceMetadataResponse(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    conversation_id: str
     answer: str
     source_snippets: List[str]
     source_metadata: List[SourceMetadataResponse]
+
+
+class ConversationData(BaseModel):
+    id: str
+    user_id: str
+    title: str
+    created_at: str
+    updated_at: str
+    message_count: int
+
+
+class ListConversationsResponse(BaseModel):
+    conversations: List[ConversationData]
+    total: int
 
 
 class UploadResponse(BaseModel):
@@ -69,13 +87,13 @@ class HealthResponse(BaseModel):
 
 
 # ============================================================================
-# FASTAPI APP
+# FASTAPI APP & CONVERSATION MANAGER
 # ============================================================================
 
 app = FastAPI(
     title="RAG Chatbot API",
-    description="Retrieve-Augmented Generation chatbot with PDF upload",
-    version="1.0.0"
+    description="Retrieve-Augmented Generation chatbot with PDF upload and conversation persistence",
+    version="1.1.0"
 )
 
 # Add CORS middleware to allow Streamlit frontend requests
@@ -85,6 +103,13 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# Initialize conversation manager (SQLite + in-memory cache)
+# Maintains last 3 conversations in memory, archives rest to SQLite
+conversation_manager = ConversationManager(
+    db_path="./conversations.db",
+    max_cache_size=3
 )
 
 # ============================================================================
@@ -158,26 +183,63 @@ async def upload_pdf(file: UploadFile = File(...)):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
-    Chat endpoint for multi-turn conversations.
+    Chat endpoint with conversation persistence.
 
-    Accepts a user question and optional conversation history.
-    Returns an answer grounded in the vector DB with source attribution.
+    Creates or loads a conversation, saves user message, gets RAG response,
+    and saves assistant message to SQLite + memory cache.
 
     Args:
-        request: ChatRequest with question and optional conversation history
+        request: ChatRequest with question, conversation_id (optional), user_id
 
     Returns:
-        ChatResponse with answer, source snippets, and metadata
+        ChatResponse with conversation_id, answer, sources
     """
     try:
-        question = request.question
+        # Get or create conversation
+        if request.conversation_id:
+            conversation = conversation_manager.get_conversation(request.conversation_id)
+            if not conversation:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Conversation not found: {request.conversation_id}"
+                )
+            conversation_id = request.conversation_id
+        else:
+            # Generate new conversation ID and create
+            conversation_id = str(uuid.uuid4())
+            conversation_manager.create_conversation(
+                conversation_id=conversation_id,
+                user_id=request.user_id,
+                title=f"Chat - {request.question[:50]}...",
+                metadata={"first_question": request.question}
+            )
 
-        # TODO: In a more sophisticated system, pass conversation history to the agent
-        # For now, each question is treated independently
-        # conversation_history is available in request.conversation_history for future enhancement
+        # Save user message
+        conversation_manager.add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=request.question,
+            metadata={"type": "question"}
+        )
 
-        # Run RAG agent
-        response = await rag_main(question)
+        # Get conversation context (last 5 messages) for RAG agent
+        # Note: Currently the agent doesn't use this, but it's available
+        context_messages = conversation_manager.get_context(conversation_id, last_n=5)
+
+        # Run RAG agent with the question
+        response = await rag_main(request.question)
+
+        # Save assistant message
+        conversation_manager.add_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=response.answer,
+            metadata={
+                "type": "answer",
+                "sources": len(response.source_metadata),
+                "relevance_scores": [m.relevance_score for m in response.source_metadata]
+            }
+        )
 
         # Convert SourceMetadata objects to response format
         source_metadata_list = [
@@ -191,15 +253,130 @@ async def chat(request: ChatRequest):
         ]
 
         return ChatResponse(
+            conversation_id=conversation_id,
             answer=response.answer,
             source_snippets=response.source_snippet,
             source_metadata=source_metadata_list
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Error processing chat: {str(e)}"
+        )
+
+
+# ============================================================================
+# CONVERSATION MANAGEMENT ENDPOINTS
+# ============================================================================
+
+@app.get("/conversations")
+async def list_conversations(user_id: str = "default_user", limit: int = 10):
+    """
+    List conversations for a user.
+
+    Args:
+        user_id: User ID
+        limit: Maximum number of conversations to return
+
+    Returns:
+        List of conversations (without messages)
+    """
+    try:
+        conversations = conversation_manager.list_conversations(user_id, limit)
+        return ListConversationsResponse(
+            conversations=[
+                ConversationData(
+                    id=conv["id"],
+                    user_id=conv["user_id"],
+                    title=conv["title"],
+                    created_at=conv["created_at"],
+                    updated_at=conv["updated_at"],
+                    message_count=len(conv.get("messages", []))
+                )
+                for conv in conversations
+            ],
+            total=len(conversations)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error listing conversations: {str(e)}"
+        )
+
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    """
+    Get a specific conversation with all messages.
+
+    Args:
+        conversation_id: Conversation ID
+
+    Returns:
+        Conversation data with all messages
+    """
+    try:
+        conversation = conversation_manager.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Conversation not found: {conversation_id}"
+            )
+        return conversation
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving conversation: {str(e)}"
+        )
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """
+    Delete a conversation and all its messages.
+
+    Args:
+        conversation_id: Conversation ID
+
+    Returns:
+        Confirmation message
+    """
+    try:
+        success = conversation_manager.delete_conversation(conversation_id)
+        if not success:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Conversation not found: {conversation_id}"
+            )
+        return {"status": "deleted", "conversation_id": conversation_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error deleting conversation: {str(e)}"
+        )
+
+
+@app.get("/status")
+async def get_status():
+    """Get system status including cache statistics."""
+    try:
+        cache_stats = conversation_manager.get_cache_stats()
+        return {
+            "status": "healthy",
+            "cache": cache_stats,
+            "database": "conversations.db"
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting status: {str(e)}"
         )
 
 
@@ -214,4 +391,8 @@ if __name__ == "__main__":
     host = os.getenv("BACKEND_HOST", "0.0.0.0")
 
     print(f"🚀 Starting RAG Chatbot API on {host}:{port}")
+    print(f"📁 Conversations stored in: ./conversations.db")
+    print(f"💾 In-memory cache size: 3 conversations")
+
+
     uvicorn.run(app, host=host, port=port)
