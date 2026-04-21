@@ -86,7 +86,15 @@ SYSTEM_PROMPT = """You are a professional technical assistant for Vector Elektro
 - Making logical deductions (e.g., "Since X, then Y must be...")
 - Elaborating beyond retrieved text
 - Answering if retrieve_context found nothing
-- Unformatted walls of text for complex information"""
+- Unformatted walls of text for complex information
+
+📊 CHART GENERATION:
+- When the user asks for a chart, graph, bar chart, or visual comparison, call generate_chart_data
+- Extract numeric values directly from retrieved context (do not infer or estimate)
+- Use chart_type "bar" for comparisons/specifications, "line" for trends over time
+- Labels must be category names, values must be numeric
+- Always call retrieve_context first, then generate_chart_data with data found in context
+- Use clear, descriptive titles for charts"""
 
 
 # ============================================================================
@@ -113,6 +121,18 @@ class AgentResponse(BaseModel):
     source_metadata: List[SourceMetadata] = Field(
         default_factory=list,
         description="Metadata about the retrieved sources (file name, page number, relevance)"
+    )
+    chart_type: Optional[str] = Field(
+        default=None,
+        description="Chart type if generated: 'bar' or 'line'"
+    )
+    chart_data: Optional[Dict] = Field(
+        default=None,
+        description="Chart data as {label: value} dictionary"
+    )
+    chart_title: Optional[str] = Field(
+        default=None,
+        description="Title for the generated chart"
     )
 
 
@@ -479,6 +499,9 @@ class RagAgentContext:
     rag_client: EVDocsClient
     retrieved_metadata: List[SourceMetadata] = None
     conversation_context: Optional[List[Dict[str, str]]] = None
+    chart_type: Optional[str] = None
+    chart_data: Optional[Dict] = None
+    chart_title: Optional[str] = None
 
     def __post_init__(self):
         if self.retrieved_metadata is None:
@@ -685,6 +708,40 @@ async def retrieve_context(ctx: RunContext[RagAgentContext], query: str, top_n_r
     return "\n".join(context_parts)
 
 
+async def generate_chart_data(
+    ctx: RunContext[RagAgentContext],
+    chart_type: str,
+    title: str,
+    labels: List[str],
+    values: List[float]
+) -> str:
+    """
+    Tool: Structure data as a chart specification for frontend rendering.
+
+    Call this when the user requests a chart, graph, or visual comparison.
+    Only use data explicitly found in the retrieved context.
+
+    Args:
+        ctx: Pydantic AI context
+        chart_type: Type of chart - "bar" or "line"
+        title: Descriptive chart title
+        labels: List of category labels (x-axis)
+        values: List of numeric values corresponding to labels (y-axis)
+
+    Returns:
+        Confirmation string (chart data is stored in context for response)
+    """
+    if len(labels) != len(values):
+        return "Error: labels and values must have the same length"
+
+    ctx.deps.chart_data = dict(zip(labels, values))
+    ctx.deps.chart_type = chart_type
+    ctx.deps.chart_title = title
+
+    logger.info(f"Chart data generated: {chart_type} chart '{title}' with {len(labels)} data points")
+    return f"Chart data structured: {chart_type} chart with {len(labels)} data points ({', '.join(labels)})"
+
+
 # ============================================================================
 # RAG AGENT
 # ============================================================================
@@ -692,7 +749,7 @@ async def retrieve_context(ctx: RunContext[RagAgentContext], query: str, top_n_r
 agent = Agent(
     model="claude-haiku-4-5-20251001",
     output_type=AgentResponse,
-    tools=[retrieve_context],
+    tools=[retrieve_context, generate_chart_data],
     system_prompt=SYSTEM_PROMPT,
     deps_type=RagAgentContext
 )
@@ -794,6 +851,12 @@ async def main(question: str, conversation_context: Optional[List[Dict[str, str]
 
     # Add retrieved metadata to response
     response.source_metadata = context.retrieved_metadata
+
+    # Pass chart data from tool call into response if generated
+    if context.chart_data:
+        response.chart_type = context.chart_type
+        response.chart_data = context.chart_data
+        response.chart_title = context.chart_title
 
     # Return structured response with metadata
     return response

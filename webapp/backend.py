@@ -59,6 +59,9 @@ class ChatResponse(BaseModel):
     answer: str
     source_snippets: List[str]
     source_metadata: List[SourceMetadataResponse]
+    chart_type: Optional[str] = None
+    chart_data: Optional[dict] = None
+    chart_title: Optional[str] = None
 
 
 class ConversationData(BaseModel):
@@ -256,7 +259,10 @@ async def chat(request: ChatRequest):
             conversation_id=conversation_id,
             answer=response.answer,
             source_snippets=response.source_snippet,
-            source_metadata=source_metadata_list
+            source_metadata=source_metadata_list,
+            chart_type=response.chart_type,
+            chart_data=response.chart_data,
+            chart_title=response.chart_title
         )
 
     except HTTPException:

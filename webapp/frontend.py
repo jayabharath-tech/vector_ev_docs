@@ -233,7 +233,7 @@ with chat_container:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-            # Display sources for assistant messages
+            # Display sources and charts for assistant messages
             if message["role"] == "assistant" and idx in st.session_state.source_metadata_cache:
                 cache_data = st.session_state.source_metadata_cache[idx]
                 source_metadata = cache_data["source_metadata"]
@@ -242,6 +242,15 @@ with chat_container:
                 unique_files = list(dict.fromkeys([meta['file_name'] for meta in source_metadata]))
 
                 st.divider()
+
+                # Display chart if present
+                if cache_data.get("chart_type") and cache_data.get("chart_data"):
+                    st.subheader(cache_data.get("chart_title", "Chart"))
+                    if cache_data["chart_type"] == "bar":
+                        st.bar_chart(cache_data["chart_data"])
+                    elif cache_data["chart_type"] == "line":
+                        st.line_chart(cache_data["chart_data"])
+                    st.divider()
 
                 # Show sources as expandable list
                 with st.expander("📄 Sources"):
@@ -282,6 +291,14 @@ if user_input:
                 # Display answer
                 st.markdown(response["answer"])
 
+                # Display chart if present
+                if response.get("chart_type") and response.get("chart_data"):
+                    st.subheader(response.get("chart_title", "Chart"))
+                    if response["chart_type"] == "bar":
+                        st.bar_chart(response["chart_data"])
+                    elif response["chart_type"] == "line":
+                        st.line_chart(response["chart_data"])
+
                 # Update conversation ID if backend returned a new one
                 if response.get("conversation_id"):
                     st.session_state.conversation_id = response["conversation_id"]
@@ -293,11 +310,14 @@ if user_input:
                     "content": response["answer"]
                 })
 
-                # Store source metadata for this assistant message
+                # Store source metadata and chart data for this assistant message
                 if response.get("source_metadata"):
                     st.session_state.source_metadata_cache[message_index] = {
                         "source_metadata": response["source_metadata"],
-                        "source_snippets": response["source_snippets"]
+                        "source_snippets": response["source_snippets"],
+                        "chart_type": response.get("chart_type"),
+                        "chart_data": response.get("chart_data"),
+                        "chart_title": response.get("chart_title"),
                     }
 
                 # Rerun to show updated chat
