@@ -55,6 +55,12 @@ RAG_ENABLE_QUERY_EXPANSION = os.getenv("RAG_ENABLE_QUERY_EXPANSION", "true").low
 RAG_LLM_PROVIDER = os.getenv("RAG_LLM_PROVIDER", "anthropic").lower()
 RAG_LLM_MODEL = os.getenv("RAG_LLM_MODEL", "claude-haiku-4-5-20251001")
 
+# PDF Ingestion batch size
+# Set in .env: RAG_INGEST_BATCH_SIZE=30 (default: 30)
+# For large PDFs with many chunks, batching prevents memory overflow
+# Smaller batch = more stable but slower, larger batch = faster but uses more RAM
+RAG_INGEST_BATCH_SIZE = int(os.getenv("RAG_INGEST_BATCH_SIZE", "30"))
+
 init_telemetry(project_name="Vector EV Docs RAG")
 
 # ============================================================================
@@ -154,7 +160,8 @@ async def describe_image_with_vision(image_bytes: bytes, media_type: str = "imag
         return response.content[0].text
 
 
-SYSTEM_PROMPT = """You are a professional technical assistant for Vector Elektronik documentation.
+# SYSTEM_PROMPT = """You are a professional technical assistant for Electric Vehicles Safety documentation.
+SYSTEM_PROMPT = """You are a professional technical assistant to read and present the data from a knowledgebase.
 
 🔴 MANDATORY GROUNDING RULES (non-negotiable):
 1. BEFORE answering ANY question, you MUST use the retrieve_context tool
@@ -331,92 +338,124 @@ class EVDocsClient:
         # Step 2: Chunk the markdown content
         # Chunks preserve semantic boundaries and include all content types
         chunks = self.chunk(markdown_text)
-        logger.debug(f"Created {len(chunks)} semantic chunks")
+        logger.debug(f"Created {len(chunks)} semantic chunks from text")
 
-        # Step 3: Collect chunks and metadata (encode later in batch)
-        all_chunks = []
-        all_metadatas = []
-        all_ids = []
+        # Step 3: Stream-process text chunks in batches (encode + flush immediately)
+        # This avoids loading all chunks into memory at once
+        batch_size = RAG_INGEST_BATCH_SIZE
+        chunk_counter = 0
 
-        for chunk_id, chunk in enumerate(chunks):
-            # Prepare metadata for retrieval traceability
-            # METADATA PROPAGATION: These fields flow through:
-            # ingest() → VectorDB → retrieve_context() → AgentResponse
-            # Enables full source attribution in final answer
-            metadata = {
-                "file_name": file_name,  # PDF filename for source citation
-                "page_number": 0,  # pymupdf4llm doesn't preserve page boundaries in markdown
-                "chunk_index": chunk_id,  # Position in document
-                "chunk_size": len(chunk),  # Text length in chars
-                "content_type": "markdown"  # Includes text + tables + image descriptions
-            }
+        logger.info(f"Processing {len(chunks)} text chunks in batches of {batch_size}...")
 
-            all_chunks.append(chunk)
-            all_metadatas.append(metadata)
-            all_ids.append(f"{pdf_path.stem}_{chunk_id}")
+        for batch_start in range(0, len(chunks), batch_size):
+            batch_end = min(batch_start + batch_size, len(chunks))
+            batch_chunks = chunks[batch_start:batch_end]
+            batch_num = batch_start // batch_size + 1
+            total_batches = (len(chunks) + batch_size - 1) // batch_size
 
-        # Step 3b: Extract and describe images with vision API
+            # Build metadata for this batch
+            batch_ids = []
+            batch_metadatas = []
+            for chunk_id, chunk in enumerate(batch_chunks, start=batch_start):
+                batch_ids.append(f"{pdf_path.stem}_{chunk_id}")
+                batch_metadatas.append({
+                    "file_name": file_name,
+                    "page_number": 0,
+                    "chunk_index": chunk_id,
+                    "chunk_size": len(chunk),
+                    "content_type": "markdown"
+                })
+
+            # Encode this batch
+            logger.debug(f"  Text batch {batch_num}/{total_batches}: Encoding chunks {batch_start+1}-{batch_end}...")
+            embeddings = self.encoder.encode(batch_chunks, batch_size=32, show_progress_bar=False)
+
+            # Upsert this batch immediately
+            self.db_client.upsert_chunks(
+                ids=batch_ids,
+                embeddings=embeddings.tolist(),
+                documents=batch_chunks,
+                metadatas=batch_metadatas
+            )
+            chunk_counter += len(batch_chunks)
+            logger.debug(f"  ✓ Text batch {batch_num}/{total_batches} complete ({chunk_counter} total chunks)")
+
+        # Step 3b: Extract and describe images with vision API (stream-process in batches)
         try:
             import fitz
             doc = fitz.open(str(pdf_path))
             total_images = sum(len(page.get_images(full=True)) for page in doc)
 
             if total_images > 0:
-                logger.info(f"Extracting {total_images} images from PDF...")
+                logger.info(f"Extracting and describing {total_images} images from PDF...")
 
-            image_count = 0
-            for page_num, page in enumerate(doc):
-                image_list = page.get_images(full=True)
-                for img_idx, img_info in enumerate(image_list):
-                    xref = img_info[0]
-                    try:
-                        img_data = doc.extract_image(xref)
-                        image_bytes = img_data["image"]
-                        ext = img_data.get("ext", "png")
-                        media_type = f"image/{ext}" if ext in ("png", "jpeg", "gif", "webp") else "image/png"
+                image_chunks = []
+                image_metadatas = []
+                image_ids = []
+                image_count = 0
 
-                        image_count += 1
-                        logger.info(f"  Describing image {image_count}/{total_images} (page {page_num+1})...")
-                        description = await self._describe_image(image_bytes, media_type)
+                for page_num, page in enumerate(doc):
+                    image_list = page.get_images(full=True)
+                    for img_idx, img_info in enumerate(image_list):
+                        xref = img_info[0]
+                        try:
+                            img_data = doc.extract_image(xref)
+                            image_bytes = img_data["image"]
+                            ext = img_data.get("ext", "png")
+                            media_type = f"image/{ext}" if ext in ("png", "jpeg", "gif", "webp") else "image/png"
 
-                        all_ids.append(f"{pdf_path.stem}_img_{page_num}_{img_idx}")
-                        all_chunks.append(description)
-                        all_metadatas.append({
-                            "file_name": file_name,
-                            "page_number": page_num,
-                            "chunk_index": len(all_chunks) - 1,
-                            "chunk_size": len(description),
-                            "content_type": "image_description",
-                        })
-                    except Exception as e:
-                        logger.warning(f"  Skipping image {img_idx} on page {page_num}: {e}")
+                            image_count += 1
+                            logger.info(f"  Image {image_count}/{total_images}: Describing (page {page_num+1})...")
+                            description = await self._describe_image(image_bytes, media_type)
+
+                            image_ids.append(f"{pdf_path.stem}_img_{page_num}_{img_idx}")
+                            image_chunks.append(description)
+                            image_metadatas.append({
+                                "file_name": file_name,
+                                "page_number": page_num,
+                                "chunk_index": chunk_counter + len(image_chunks) - 1,
+                                "chunk_size": len(description),
+                                "content_type": "image_description",
+                            })
+
+                            # If batch is full, encode and upsert immediately
+                            if len(image_chunks) >= batch_size:
+                                logger.debug(f"  Image batch: Encoding and flushing {len(image_chunks)} descriptions...")
+                                embeddings = self.encoder.encode(image_chunks, batch_size=32, show_progress_bar=False)
+                                self.db_client.upsert_chunks(
+                                    ids=image_ids,
+                                    embeddings=embeddings.tolist(),
+                                    documents=image_chunks,
+                                    metadatas=image_metadatas
+                                )
+                                chunk_counter += len(image_chunks)
+                                logger.debug(f"  ✓ Image batch complete ({chunk_counter} total chunks)")
+                                # Reset for next batch
+                                image_chunks = []
+                                image_metadatas = []
+                                image_ids = []
+
+                        except Exception as e:
+                            logger.warning(f"  Skipping image {img_idx} on page {page_num}: {e}")
+
+                # Flush remaining image chunks if any
+                if image_chunks:
+                    logger.debug(f"  Flushing remaining {len(image_chunks)} image descriptions...")
+                    embeddings = self.encoder.encode(image_chunks, batch_size=32, show_progress_bar=False)
+                    self.db_client.upsert_chunks(
+                        ids=image_ids,
+                        embeddings=embeddings.tolist(),
+                        documents=image_chunks,
+                        metadatas=image_metadatas
+                    )
+                    chunk_counter += len(image_chunks)
+                    logger.debug(f"  ✓ Final image batch complete ({chunk_counter} total chunks)")
+
             doc.close()
         except Exception as e:
             logger.warning(f"Image extraction failed: {e}")
 
-        # Step 4: BATCH ENCODE all chunks at once
-        # sentence-transformers.encode() with batch_size parameter handles batching internally
-        # batch_size=32: Process 32 chunks together using PyTorch vectorization
-        # show_progress_bar=True: Visual feedback for large PDFs
-        logger.debug(f"Encoding {len(all_chunks)} chunks in batches of 32...")
-        embeddings_array = self.encoder.encode(
-            all_chunks,
-            batch_size=32,
-            show_progress_bar=False  # Set to True for progress visualization
-        )
-        # Convert numpy ndarray to list for type compatibility
-        all_embeddings = embeddings_array.tolist()
-
-        # Step 5: Store in vector DB with unique IDs per file
-        # IDs were built incrementally: text chunks use f"{stem}_{i}", image chunks use f"{stem}_img_{page}_{idx}"
-        self.db_client.upsert_chunks(
-            ids=all_ids,
-            embeddings=all_embeddings,
-            documents=all_chunks,
-            metadatas=all_metadatas
-        )
-
-        status = f"✓ Ingested {file_name}: {len(all_chunks)} chunks stored (batch encoded)"
+        status = f"✓ Ingested {file_name}: {chunk_counter} chunks stored in streaming batches of {batch_size}"
         logger.info(status)
         return status
 

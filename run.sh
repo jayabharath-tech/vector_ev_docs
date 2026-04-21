@@ -59,7 +59,7 @@ FRONTEND_PID=$!
 echo ""
 echo -e "${GREEN}✅ Both services started!${NC}"
 echo ""
-echo "📍 Frontend: http://localhost:${STREAMLIT_SERVER_PORT:-8501}"
+echo "📍 Frontend: http://localhost:${STREAMLIT_SERVER_PORT:-8502}"
 echo "📍 Backend API: http://localhost:${BACKEND_PORT:-8000}/docs"
 echo ""
 echo "Press Ctrl+C to stop all services"
