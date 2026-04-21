@@ -222,12 +222,12 @@ async def chat(request: ChatRequest):
             metadata={"type": "question"}
         )
 
-        # Get conversation context (last 5 messages) for RAG agent
-        # Note: Currently the agent doesn't use this, but it's available
-        context_messages = conversation_manager.get_context(conversation_id, last_n=5)
+        # Get conversation context (last 2-3 messages) for RAG agent to understand continuity
+        # Exclude the current user message (it's the last one just added)
+        context_messages = conversation_manager.get_context(conversation_id, last_n=4)[:-1]  # Remove current message
 
-        # Run RAG agent with the question
-        response = await rag_main(request.question)
+        # Run RAG agent with the question and conversation history
+        response = await rag_main(request.question, conversation_context=context_messages)
 
         # Save assistant message
         conversation_manager.add_message(

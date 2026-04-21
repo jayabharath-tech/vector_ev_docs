@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 import pymupdf4llm  # Extracts text + tables + image descriptions
 import re  # Regex for markdown structure detection
 
@@ -478,10 +478,13 @@ class RagAgentContext:
     """Context for RAG agent."""
     rag_client: EVDocsClient
     retrieved_metadata: List[SourceMetadata] = None
+    conversation_context: Optional[List[Dict[str, str]]] = None
 
     def __post_init__(self):
         if self.retrieved_metadata is None:
             self.retrieved_metadata = []
+        if self.conversation_context is None:
+            self.conversation_context = []
 
 
 # ============================================================================
@@ -653,6 +656,16 @@ async def retrieve_context(ctx: RunContext[RagAgentContext], query: str, top_n_r
     rag_context.retrieved_metadata = []
     context_parts = []
 
+    # Include conversation context if available
+    if rag_context.conversation_context:
+        context_parts.append("--- CONVERSATION CONTEXT (Previous Messages) ---")
+        for msg in rag_context.conversation_context:
+            role = msg.get("role", "unknown").upper()
+            content = msg.get("content", "")
+            context_parts.append(f"{role}: {content}")
+        context_parts.append("--- END CONVERSATION CONTEXT ---\n")
+        logger.debug(f"Added conversation context with {len(rag_context.conversation_context)} previous messages")
+
     for i, (doc, metadata, score) in enumerate(sorted_results, 1):
         source_meta = SourceMetadata(
             file_name=metadata.get("file_name", "unknown"),
@@ -737,12 +750,13 @@ async def ingest_pdf(pdf_path: str = "data") -> None:
         raise FileNotFoundError(f"Path not found: {pdf_path}")
 
 
-async def main(question: str) -> AgentResponse:
+async def main(question: str, conversation_context: Optional[List[Dict[str, str]]] = None) -> AgentResponse:
     """
     Query the RAG agent (assumes PDF already ingested).
 
     Args:
         question: User's question
+        conversation_context: Optional list of previous messages ({"role": "user"|"assistant", "content": "..."})
 
     Returns:
         AgentResponse with answer, source snippet, and metadata
@@ -754,7 +768,7 @@ async def main(question: str) -> AgentResponse:
     rag_client = get_pdf_client()
 
     # Create agent context (will be populated with metadata during retrieval)
-    context = RagAgentContext(rag_client=rag_client)
+    context = RagAgentContext(rag_client=rag_client, conversation_context=conversation_context or [])
 
     # Run agent with context
     result = await agent.run(question, deps=context)
