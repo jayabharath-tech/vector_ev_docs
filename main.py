@@ -164,11 +164,25 @@ async def describe_image_with_vision(image_bytes: bytes, media_type: str = "imag
 SYSTEM_PROMPT = """You are a professional technical assistant to read and present the data from a knowledgebase.
 
 🔴 MANDATORY GROUNDING RULES (non-negotiable):
-1. BEFORE answering ANY question, you MUST use the retrieve_context tool
+1. BEFORE answering ANY question, you MUST use the retrieve_context tool EXACTLY ONCE per question
+   - Single retrieve_context call retrieves comprehensive results
+   - Do NOT make multiple retrieve_context calls with different queries
+   - Do NOT call retrieve_context again to get "more specific" information
 2. Your answer must ONLY contain facts explicitly stated in the retrieved context
 3. Do NOT use your training data, general knowledge, or inference
 4. Do NOT interpret, combine, or deduce facts beyond what's explicitly written
 5. If retrieved context is empty or irrelevant, respond: "This information is not available in the knowledge base"
+
+✅ ALLOWED TOOL SEQUENCE (and ONLY this sequence):
+1. Call retrieve_context(user_question) ONCE
+2. IF user asks for chart AND retrieved data has numeric metrics:
+   - Call generate_chart_data with the numeric values from step 1
+3. Generate final answer combining both results
+
+❌ FORBIDDEN:
+- Calling retrieve_context multiple times
+- Trying different query variations with retrieve_context
+- Calling retrieve_context after generate_chart_data to "get more info"
 
 📋 PROFESSIONAL TONE & FORMATTING:
 - Use clear, concise, professional language
@@ -202,13 +216,22 @@ SYSTEM_PROMPT = """You are a professional technical assistant to read and presen
 - Answering if retrieve_context found nothing
 - Unformatted walls of text for complex information
 
-📊 CHART GENERATION:
-- When the user asks for a chart, graph, bar chart, or visual comparison, call generate_chart_data
-- Extract numeric values directly from retrieved context (do not infer or estimate)
-- Use chart_type "bar" for comparisons/specifications, "line" for trends over time
-- Labels must be category names, values must be numeric
-- Always call retrieve_context first, then generate_chart_data with data found in context
-- Use clear, descriptive titles for charts"""
+📊 CHART GENERATION (ONLY if numeric metrics exist):
+PREREQUISITES - MUST have actual numeric data to create a chart:
+- ✅ DO CREATE CHART if: Max Current (A), Power (kW), Voltage (V), Cost ($), Speed (km/h), etc.
+- ❌ DO NOT CREATE CHART if: Qualitative features (yes/no), boolean characteristics, names only, no numeric values
+EXAMPLE OF WHEN TO REFUSE CHART:
+  User: "Compare technologies A, B, C"
+  Retrieved text: Lists features like "Supports wireless", "Allows configuration", "Compatible with"
+  Action: DO NOT call generate_chart_data (no numeric data). Explain: "No numeric metrics available for comparison"
+
+WHEN USER ASKS FOR CHART:
+- ONLY if retrieved context contains actual numbers/values, call generate_chart_data
+- Extract ONLY real numeric values from retrieved context (NEVER fabricate, estimate, or infer values)
+- Use chart_type "bar" for comparisons, "line" for trends over time
+- If NO numeric data found, respond: "I cannot create a chart for this comparison as there are no quantifiable metrics in the knowledge base"
+- Labels = category names, Values = only actual numeric data from context
+"""
 
 
 # ============================================================================
@@ -625,6 +648,8 @@ class RagAgentContext:
     chart_type: Optional[str] = None
     chart_data: Optional[Dict] = None
     chart_title: Optional[str] = None
+    tool_call_count: int = 0  # Track number of tool calls to limit them
+    max_tool_calls: int = 2  # Maximum allowed tool calls per question (retrieve + chart)
 
     def __post_init__(self):
         if self.retrieved_metadata is None:
@@ -640,6 +665,8 @@ class RagAgentContext:
 async def expand_query(query: str, num_expansions: int = 3) -> List[str]:
     """
     Generate alternative query phrasings using Claude for better retrieval.
+
+    ⚠️  LLM CALL #1: Makes 1 LLM API call to generate alternative queries
 
     LLM-BASED QUERY EXPANSION:
     Improves retrieval by generating semantically equivalent queries with:
@@ -761,11 +788,24 @@ async def retrieve_context(ctx: RunContext[RagAgentContext], query: str, top_n_r
     Returns:
         Retrieved context as formatted string with source metadata
     """
+    logger.info(f"🟡 retrieve_context() called for: {query[:60]}...")
+
     rag_context = ctx.deps
+
+    # TOOL CALL LIMIT CHECK: Prevent excessive retrieve_context calls
+    if rag_context.tool_call_count >= rag_context.max_tool_calls:
+        logger.warning(f"Tool call limit reached ({rag_context.tool_call_count}/{rag_context.max_tool_calls}). Refusing additional retrieve_context calls.")
+        return f"Tool call limit reached (max {rag_context.max_tool_calls} calls per question). Cannot make additional retrieval calls. Answer the user's question using the context already retrieved."
+
+    # Increment tool call counter
+    rag_context.tool_call_count += 1
+    logger.info(f"Tool call #{rag_context.tool_call_count}/{rag_context.max_tool_calls}")
+
     rag_client = rag_context.rag_client
 
     # Step 1: Optionally expand query based on environment configuration
     if RAG_ENABLE_QUERY_EXPANSION:
+        logger.info(f"   → Calling expand_query (⚠️  LLM CALL)")
         expanded_queries = await expand_query(query, num_expansions=3)
         logger.debug(f"Searching with {len(expanded_queries)} query variations")
     else:
@@ -848,8 +888,8 @@ async def generate_chart_data(
     """
     Tool: Structure data as a chart specification for frontend rendering.
 
-    Call this when the user requests a chart, graph, or visual comparison.
-    Only use data explicitly found in the retrieved context.
+    ONLY call this when you have actual numeric metrics from retrieved context.
+    Do NOT create charts for qualitative data (yes/no, features, boolean flags).
 
     Args:
         ctx: Pydantic AI context
@@ -859,17 +899,38 @@ async def generate_chart_data(
         values: List of numeric values corresponding to labels (y-axis)
 
     Returns:
-        Confirmation string (chart data is stored in context for response)
+        Confirmation string if valid, or error message if data is invalid
     """
+    # TOOL CALL LIMIT CHECK: Prevent excessive tool calls
+    if ctx.deps.tool_call_count >= ctx.deps.max_tool_calls:
+        logger.warning(f"Tool call limit reached ({ctx.deps.tool_call_count}/{ctx.deps.max_tool_calls}). Refusing chart generation.")
+        return f"Tool call limit reached. Cannot generate chart. Answer the user's question using available context."
+
+    # Increment tool call counter
+    ctx.deps.tool_call_count += 1
+    logger.info(f"Tool call #{ctx.deps.tool_call_count}/{ctx.deps.max_tool_calls} (chart generation)")
+
     if len(labels) != len(values):
         return "Error: labels and values must have the same length"
+
+    # Validate that values have actual variation (not all same, not all 1.0)
+    unique_values = set(values)
+    if len(unique_values) == 1:
+        # All values are the same - this indicates dummy/fabricated data
+        logger.warning(f"Rejected chart: all values are {values[0]} (no variation in data)")
+        return f"Cannot create chart: all data points have the same value ({values[0]}). This indicates no real metrics for comparison. Please provide actual numeric data from the knowledge base."
+
+    # Check if values are suspiciously all 1.0 (common fabrication)
+    if all(v == 1.0 for v in values):
+        logger.warning(f"Rejected chart: all values are 1.0 (dummy data)")
+        return "Cannot create chart: all values are 1.0 (dummy data). This indicates you're trying to chart qualitative data that has no numeric metrics. Only create charts when there are actual numeric values (prices, speeds, power, voltages, etc.) to compare."
 
     ctx.deps.chart_data = dict(zip(labels, values))
     ctx.deps.chart_type = chart_type
     ctx.deps.chart_title = title
 
-    logger.info(f"Chart data generated: {chart_type} chart '{title}' with {len(labels)} data points")
-    return f"Chart data structured: {chart_type} chart with {len(labels)} data points ({', '.join(labels)})"
+    logger.info(f"Chart data generated: {chart_type} chart '{title}' with {len(labels)} data points (values: {unique_values})")
+    return f"Chart generated: {chart_type} chart '{title}' with {len(labels)} data points ({', '.join(labels)})"
 
 
 # ============================================================================
@@ -887,7 +948,9 @@ agent = Agent(
     output_type=AgentResponse,
     tools=[retrieve_context, generate_chart_data],
     system_prompt=SYSTEM_PROMPT,
-    deps_type=RagAgentContext
+    deps_type=RagAgentContext,
+    retries=1,
+    end_strategy='exhaustive'  # Allow multiple tool calls (retrieve + chart)
 )
 
 logger.info(f"RAG Agent initialized with {RAG_LLM_PROVIDER} provider (model: {RAG_LLM_MODEL})")
@@ -959,6 +1022,8 @@ async def main(question: str, conversation_context: Optional[List[Dict[str, str]
     Raises:
         ValueError: If retrieve_context tool was not called or returned no results
     """
+    logger.info(f"🔵 main() called - ⚠️  LLM CALL #2: Agent will run for: {question[:60]}...")
+
     # Initialize RAG client with VectorDBClient
     rag_client = get_pdf_client()
 
