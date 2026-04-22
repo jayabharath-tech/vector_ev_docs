@@ -649,7 +649,7 @@ class RagAgentContext:
     chart_data: Optional[Dict] = None
     chart_title: Optional[str] = None
     tool_call_count: int = 0  # Track number of tool calls to limit them
-    max_tool_calls: int = 2  # Maximum allowed tool calls per question (retrieve + chart)
+    max_tool_calls: int = 4  # Maximum allowed tool calls per question (retrieve + chart)
 
     def __post_init__(self):
         if self.retrieved_metadata is None:
