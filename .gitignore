@@ -1,0 +1,10 @@
+__pycache__
+.venv
+kb/**
+ev_vector_db/
+*.claude
+temp_uploads
+.env
+.idea
+*.log
+conversations.db
